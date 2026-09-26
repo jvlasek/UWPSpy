@@ -4,6 +4,9 @@
 
 #include "AboutDlg.h"
 #include "flash_area.h"
+#include <memory>
+#include <atlimage.h>
+#include <dwmapi.h>
 
 namespace {
 
@@ -826,7 +829,13 @@ inline DWORD_PTR ListItemDataToDWordPtr(bool valueShownAsIs,
 
 void CMainDlg::DumpElementRecursive(std::wstring& output,
                                     InstanceHandle handle,
-                                    bool isFirst) {
+                                    bool isFirst, unsigned depth) {
+    if (m_watchPolling && depth > 256) {
+        throw winrt::hresult_error(E_FAIL, L"Subtree is too deep to watch.");
+    }
+    if (m_watchPolling && output.size() > 5 * 1024 * 1024) {
+        throw winrt::hresult_error(E_OUTOFMEMORY, L"Subtree snapshot exceeds 10 MiB.");
+    }
     // Skip separator for first element
     if (!isFirst) {
         output += L"\n";
@@ -838,6 +847,15 @@ void CMainDlg::DumpElementRecursive(std::wstring& output,
     output += L"Path: ";
     output += path.empty() ? L"(root)" : path;
     output += L"\n";
+
+    output += std::format(L"Handle: 0x{:X}\n", handle);
+    if (auto item = m_elementItems.find(handle); item != m_elementItems.end()) {
+        auto siblings = m_parentToChildren.find(item->second.parentHandle);
+        if (siblings != m_parentToChildren.end()) {
+            auto pos = std::find(siblings->second.begin(), siblings->second.end(), handle);
+            output += std::format(L"Child index: {}\n", pos - siblings->second.begin());
+        }
+    }
 
     // Get IInspectable object
     wf::IInspectable obj;
@@ -894,6 +912,11 @@ void CMainDlg::DumpElementRecursive(std::wstring& output,
         handle, &sourceCount, &pPropertySources, &propertyCount,
         &pPropertyValues);
 
+    const auto freeTaskMemory = [](void* p) { CoTaskMemFree(p); };
+    std::unique_ptr<PropertyChainSource, decltype(freeTaskMemory)> sources(
+        pPropertySources, freeTaskMemory);
+    std::unique_ptr<PropertyChainValue, decltype(freeTaskMemory)> values(
+        pPropertyValues, freeTaskMemory);
     if (SUCCEEDED(hr)) {
         // First, output local properties
         bool hasLocalProperties = false;
@@ -944,13 +967,14 @@ void CMainDlg::DumpElementRecursive(std::wstring& output,
             output += L"(no properties available)\n";
         }
 
-        // Free memory
-        CoTaskMemFree(pPropertySources);
-        CoTaskMemFree(pPropertyValues);
+
     } else {
         output += L"Properties:\n";
         output += L"(no properties available)\n";
     }
+
+    sources.reset();
+    values.reset();
 
     // Write visual states (only if any exist)
     if (obj) {
@@ -1015,8 +1039,9 @@ void CMainDlg::DumpElementRecursive(std::wstring& output,
     // Recursively dump children
     auto childrenIt = m_parentToChildren.find(handle);
     if (childrenIt != m_parentToChildren.end()) {
-        for (InstanceHandle childHandle : childrenIt->second) {
-            DumpElementRecursive(output, childHandle, false);
+        const auto children = childrenIt->second;
+        for (InstanceHandle childHandle : children) {
+            DumpElementRecursive(output, childHandle, false, depth + 1);
         }
     }
 }
@@ -1029,6 +1054,7 @@ CMainDlg::CMainDlg(winrt::com_ptr<IXamlDiagnostics> diagnostics,
       m_eventCallback(std::move(eventCallback)) {}
 
 void CMainDlg::Hide() {
+    CloseSubtreeWatch();
     ShowWindow(SW_HIDE);
 
     if (m_flashAreaWindow) {
@@ -1137,6 +1163,16 @@ void CMainDlg::ElementAdded(const ParentChildRelation& parentChildRelation,
 }
 
 void CMainDlg::ElementRemoved(InstanceHandle handle) {
+    // Removal of an ancestor also invalidates the selected subtree.
+    for (auto current = m_watchHandle; current;) {
+        if (current == handle) {
+            StopSubtreeWatch(L"Stopped: watched subtree was removed.");
+            break;
+        }
+        auto ancestor = m_elementItems.find(current);
+        if (ancestor == m_elementItems.end()) break;
+        current = ancestor->second.parentHandle;
+    }
     auto it = m_elementItems.find(handle);
     if (it == m_elementItems.end()) {
         // I've seen this happen, for example with mspaint if you open the color
@@ -1267,7 +1303,7 @@ BOOL CMainDlg::OnInitDialog(CWindow wndFocus, LPARAM lInitParam) {
     return TRUE;
 }
 
-void CMainDlg::OnDestroy() {}
+void CMainDlg::OnDestroy() { CloseSubtreeWatch(); }
 
 void CMainDlg::ApplyDarkMode() {
     if (!dark_mode::IsSystemDarkModeSupported()) {
@@ -1527,6 +1563,10 @@ void CMainDlg::OnTimer(UINT_PTR nIDEvent) {
             RefreshSelectedElementInformation(0);
             break;
 
+        case TIMER_ID_WATCH_SUBTREE:
+            PollSubtreeWatch();
+            break;
+
         case TIMER_ID_COPY_SUBTREE_DELAYED: {
             KillTimer(nIDEvent);
 
@@ -1730,7 +1770,7 @@ InstanceHandle CMainDlg::ElementFromPointInSubtree(mux::UIElement subtree,
     return 0;
 }
 
-bool CMainDlg::CreateFlashArea(InstanceHandle handle) {
+std::optional<CRect> CMainDlg::GetElementScreenRect(InstanceHandle handle, HWND* outWnd) {
     wf::IInspectable element;
     wf::IInspectable rootElement;
 
@@ -1739,7 +1779,7 @@ bool CMainDlg::CreateFlashArea(InstanceHandle handle) {
         auto it = m_elementItems.find(iterHandle);
         if (it == m_elementItems.end()) {
             ATLASSERT(FALSE);
-            return false;
+            return std::nullopt;
         }
 
         if (!it->second.parentHandle) {
@@ -1747,7 +1787,7 @@ bool CMainDlg::CreateFlashArea(InstanceHandle handle) {
                 it->first, reinterpret_cast<::IInspectable**>(
                                winrt::put_abi(rootElement)));
             if (FAILED(hr) || !rootElement) {
-                return false;
+                return std::nullopt;
             }
 
             break;
@@ -1758,7 +1798,7 @@ bool CMainDlg::CreateFlashArea(InstanceHandle handle) {
                 it->first,
                 reinterpret_cast<::IInspectable**>(winrt::put_abi(element)));
             if (FAILED(hr) || !element) {
-                return false;
+                return std::nullopt;
             }
         }
 
@@ -1769,13 +1809,15 @@ bool CMainDlg::CreateFlashArea(InstanceHandle handle) {
     CRect rootElementRect;
     if (auto rect = GetRootElementRect(rootElement, &rootWnd.m_hWnd)) {
         rootElementRect = *rect;
+    } else {
+        return std::nullopt;
     }
 
     CRect rect;
     if (element) {
         auto elementRect = GetRelativeElementRect(element);
         if (!elementRect) {
-            return false;
+            return std::nullopt;
         }
 
         rect = *elementRect;
@@ -1798,6 +1840,15 @@ bool CMainDlg::CreateFlashArea(InstanceHandle handle) {
         rect = rectWithDpi;
     }
 
+    if (outWnd) *outWnd = rootWnd;
+    return rect;
+}
+
+bool CMainDlg::CreateFlashArea(InstanceHandle handle) {
+    CWindow rootWnd;
+    auto bounds = GetElementScreenRect(handle, &rootWnd.m_hWnd);
+    if (!bounds) return false;
+    CRect rect = *bounds;
     DestroyFlashArea();
 
     if (rect.IsRectEmpty()) {
@@ -2711,6 +2762,7 @@ void CMainDlg::OnElementTreeContextMenu(CTreeViewCtrlEx treeView,
         MENU_ID_VISIBLE = 1,
         MENU_ID_COPY_ITEM,
         MENU_ID_COPY_PATH,
+        MENU_ID_WATCH_SUBTREE,
         MENU_ID_COPY_SUBTREE,
         MENU_ID_COPY_SUBTREE_DELAYED,
         MENU_ID_COPY_SUBTREE_WITH_PROPERTIES,
@@ -2756,6 +2808,9 @@ void CMainDlg::OnElementTreeContextMenu(CTreeViewCtrlEx treeView,
         menu.AppendMenu(MF_STRING, MENU_ID_COPY_SUBTREE_WITH_PROPERTIES_DELAYED,
                         L"Copy subtree with properties (10 seconds delay)");
 
+        menu.AppendMenu(MF_STRING, MENU_ID_WATCH_SUBTREE,
+                        L"Watch and export changes...");
+
         int nCmd = menu.TrackPopupMenu(TPM_RIGHTBUTTON | TPM_RETURNCMD,
                                        menuPoint.x, menuPoint.y, m_hWnd);
         switch (nCmd) {
@@ -2790,6 +2845,10 @@ void CMainDlg::OnElementTreeContextMenu(CTreeViewCtrlEx treeView,
                 }
                 break;
             }
+
+            case MENU_ID_WATCH_SUBTREE:
+                StartSubtreeWatch(handle);
+                break;
 
             case MENU_ID_COPY_SUBTREE: {
                 CString str;
@@ -2989,4 +3048,225 @@ void CMainDlg::OnVisualStateContextMenu(CTreeViewCtrlEx treeView,
             break;
         }
     }
+}
+
+INT_PTR CALLBACK CMainDlg::WatchDialogProc(HWND hwnd, UINT message,
+                                           WPARAM wParam, LPARAM lParam) {
+    auto self = reinterpret_cast<CMainDlg*>(::GetWindowLongPtr(hwnd, GWLP_USERDATA));
+    if (message == WM_INITDIALOG) {
+        ::SetWindowLongPtr(hwnd, GWLP_USERDATA, lParam);
+        return TRUE;
+    }
+    if (self && message == WM_COMMAND && LOWORD(wParam) == IDC_WATCH_START) {
+        self->BeginSubtreeWatch();
+        return TRUE;
+    }
+    if (self && (message == WM_CLOSE ||
+                 (message == WM_COMMAND && LOWORD(wParam) == IDCANCEL))) {
+        self->CloseSubtreeWatch();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void CMainDlg::StopSubtreeWatch(const wchar_t* status) {
+    KillTimer(TIMER_ID_WATCH_SUBTREE);
+    m_watchHandle = 0;
+    if (m_watchDialog) {
+        ::SetDlgItemText(m_watchDialog, IDC_WATCH_STATUS, status);
+    }
+}
+
+void CMainDlg::CloseSubtreeWatch() {
+    StopSubtreeWatch(L"Stopped.");
+    if (auto dialog = std::exchange(m_watchDialog, nullptr)) {
+        ::DestroyWindow(dialog);
+    }
+    m_watchPrevious.clear();
+}
+
+void CMainDlg::StartSubtreeWatch(InstanceHandle handle) {
+    if (m_watchPolling) return;
+    if (m_watchDialog) {
+        ::SetForegroundWindow(m_watchDialog);
+        return;
+    }
+    m_watchHandle = handle;
+    m_watchDialog = CreateDialogParam(_Module.GetResourceInstance(),
+        MAKEINTRESOURCE(IDD_WATCH_SUBTREE), m_hWnd, WatchDialogProc,
+        reinterpret_cast<LPARAM>(this));
+    if (!m_watchDialog) {
+        m_watchHandle = 0;
+        MessageBox(L"Could not create watcher dialog.", L"UWPSpy", MB_ICONERROR);
+        return;
+    }
+    wchar_t path[MAX_PATH];
+    const DWORD length = GetTempPath(ARRAYSIZE(path), path);
+    if (length && length < ARRAYSIZE(path)) {
+        ::SetDlgItemText(m_watchDialog, IDC_WATCH_FOLDER, path);
+    }
+    ::SetDlgItemText(m_watchDialog, IDC_WATCH_STATUS,
+        L"Enter an existing output folder, then click Start.\r\nUse a small subtree; each capture runs on the target UI thread.");
+    ::ShowWindow(m_watchDialog, SW_SHOW);
+}
+
+void CMainDlg::BeginSubtreeWatch() {
+    if (m_watchPolling || !m_watchDialog) return;
+    try {
+        if (!m_watchHandle || !m_elementItems.contains(m_watchHandle)) {
+            StopSubtreeWatch(L"Stopped: selected element was removed. Close and select again.");
+            return;
+        }
+        wchar_t path[32768];
+        ::GetDlgItemText(m_watchDialog, IDC_WATCH_FOLDER, path, ARRAYSIZE(path));
+        const DWORD attributes = GetFileAttributes(path);
+        if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            ::SetDlgItemText(m_watchDialog, IDC_WATCH_STATUS,
+                L"Enter the full path of an existing output folder, then click Start.");
+            return;
+        }
+        m_watchScreenshot = ::IsDlgButtonChecked(m_watchDialog, IDC_WATCH_SCREENSHOT) == BST_CHECKED;
+        GUID id;
+        winrt::check_hresult(CoCreateGuid(&id));
+        wchar_t guid[40];
+        StringFromGUID2(id, guid, ARRAYSIZE(guid));
+        m_watchFolder = std::wstring(path) + L"\\UWPSpy-" + guid;
+        winrt::check_bool(CreateDirectory(m_watchFolder.c_str(), nullptr));
+        m_watchPrevious.clear();
+        m_watchCount = 0;
+        m_watchBytes = 0;
+        ::SendDlgItemMessage(m_watchDialog, IDC_WATCH_FOLDER, EM_SETREADONLY, TRUE, 0);
+        ::EnableWindow(::GetDlgItem(m_watchDialog, IDC_WATCH_START), FALSE);
+        ::EnableWindow(::GetDlgItem(m_watchDialog, IDC_WATCH_SCREENSHOT), FALSE);
+        ::SetDlgItemText(m_watchDialog, IDC_WATCH_FOLDER, m_watchFolder.c_str());
+        ::SetDlgItemText(m_watchDialog, IDC_WATCH_STATUS,
+            L"Starting in 2 seconds. Open the flyout now if needed.");
+        if (!SetTimer(TIMER_ID_WATCH_SUBTREE, 2000)) {
+            StopSubtreeWatch(L"Stopped: could not start polling timer.");
+        }
+    } catch (...) {
+        const auto hr = winrt::to_hresult();
+        StopSubtreeWatch(L"Stopped: could not start watcher.");
+        const auto error = std::format(L"Stopped: could not start watcher (0x{:08X}).",
+                                       static_cast<unsigned>(hr));
+        ::SetDlgItemText(m_watchDialog, IDC_WATCH_STATUS, error.c_str());
+    }
+}
+
+void CMainDlg::PollSubtreeWatch() {
+    if (!m_watchHandle || m_watchPolling) return;
+    KillTimer(TIMER_ID_WATCH_SUBTREE);
+    m_watchPolling = true;
+    struct ResetPolling { bool& value; ~ResetPolling() { value = false; } } reset{m_watchPolling};
+    try {
+        const auto handle = m_watchHandle;
+        if (!m_elementItems.contains(handle)) {
+            StopSubtreeWatch(L"Stopped: watched element no longer exists.");
+            return;
+        }
+        std::wstring snapshot;
+        DumpElementRecursive(snapshot, handle, true);
+        // COM calls can pump messages: do not save after removal or Stop.
+        if (m_watchHandle != handle || !m_watchDialog) return;
+        if (!m_watchCount || snapshot != m_watchPrevious) {
+            auto utf8 = winrt::to_string(snapshot);
+            std::vector<BYTE> png;
+            if (m_watchScreenshot) png = CaptureElementPng(handle);
+            if (m_watchHandle != handle || !m_watchDialog) return;
+            if (utf8.size() > 10 * 1024 * 1024 ||
+                m_watchBytes + utf8.size() + png.size() > 100 * 1024 * 1024) {
+                StopSubtreeWatch(L"Stopped: snapshot (10 MiB) or session (100 MiB) limit reached.");
+                return;
+            }
+            SYSTEMTIME now;
+            GetSystemTime(&now);
+            auto filename = std::format(L"{}\\{:04}-{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}Z.txt",
+                m_watchFolder, m_watchCount + 1, now.wYear, now.wMonth, now.wDay,
+                now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+            auto temporary = filename + L".partial";
+            winrt::handle file(CreateFile(temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                         nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+            winrt::check_bool(static_cast<bool>(file));
+            DWORD written = 0;
+            winrt::check_bool(WriteFile(file.get(), utf8.data(), static_cast<DWORD>(utf8.size()),
+                                       &written, nullptr));
+            if (written != utf8.size()) winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_WRITE_FAULT));
+            file.close();
+            winrt::check_bool(MoveFile(temporary.c_str(), filename.c_str()));
+            if (!png.empty()) {
+                auto pngName = filename.substr(0, filename.size() - 4) + L".png";
+                auto partialPng = pngName + L".partial";
+                winrt::handle pngFile(CreateFile(partialPng.c_str(), GENERIC_WRITE,
+                    FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+                winrt::check_bool(static_cast<bool>(pngFile));
+                winrt::check_bool(WriteFile(pngFile.get(), png.data(), static_cast<DWORD>(png.size()),
+                                           &written, nullptr));
+                if (written != png.size()) winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_WRITE_FAULT));
+                pngFile.close();
+                winrt::check_bool(MoveFile(partialPng.c_str(), pngName.c_str()));
+            }
+            ++m_watchCount;
+            m_watchBytes += utf8.size() + png.size();
+            m_watchPrevious = std::move(snapshot);
+        }
+        auto status = std::format(L"Watching handle 0x{:X} every 2 seconds.\r\n{} / 200 snapshots saved ({} KiB).",
+                                  handle, m_watchCount, m_watchBytes / 1024);
+        ::SetDlgItemText(m_watchDialog, IDC_WATCH_STATUS, status.c_str());
+        if (m_watchCount == 200) {
+            StopSubtreeWatch(L"Stopped: 200 snapshots saved. Start a new watch to continue.");
+        } else if (!SetTimer(TIMER_ID_WATCH_SUBTREE, 2000)) {
+            StopSubtreeWatch(L"Stopped: could not start polling timer.");
+        }
+    } catch (...) {
+        auto message = std::format(L"Stopped: snapshot failed (0x{:08X}).",
+                                  static_cast<unsigned>(winrt::to_hresult()));
+        StopSubtreeWatch(message.c_str());
+    }
+}
+
+std::vector<BYTE> CMainDlg::CaptureElementPng(InstanceHandle handle) {
+    auto bounds = GetElementScreenRect(handle);
+    if (!bounds || bounds->IsRectEmpty()) {
+        throw winrt::hresult_error(E_FAIL, L"Selected element has no visible bounds.");
+    }
+    CRect desktop(GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+        GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN));
+    CRect rect;
+    if (!rect.IntersectRect(*bounds, desktop) ||
+        static_cast<uint64_t>(rect.Width()) * rect.Height() > 16 * 1024 * 1024) {
+        throw winrt::hresult_error(E_FAIL, L"Selected area is off screen or too large.");
+    }
+    // Restore only the same outline window, and never activate it.
+    struct OutlineRestore {
+        HWND hwnd;
+        ~OutlineRestore() { if (hwnd && ::IsWindow(hwnd)) ::ShowWindow(hwnd, SW_SHOWNOACTIVATE); }
+    } outline{m_flashAreaWindow && m_flashAreaWindow.IsWindowVisible()
+                  ? m_flashAreaWindow.m_hWnd : nullptr};
+    if (outline.hwnd) {
+        ::ShowWindow(outline.hwnd, SW_HIDE);
+        winrt::check_hresult(DwmFlush());
+    }
+    CImage bitmap;
+    winrt::check_bool(bitmap.Create(rect.Width(), rect.Height(), 24));
+    HDC screen = ::GetDC(nullptr);
+    if (!screen) winrt::throw_hresult(E_FAIL);
+    const HDC target = bitmap.GetDC();
+    const BOOL copied = ::BitBlt(target, 0, 0, rect.Width(), rect.Height(), screen,
+                                 rect.left, rect.top, SRCCOPY | CAPTUREBLT);
+    bitmap.ReleaseDC();
+    ::ReleaseDC(nullptr, screen);
+    winrt::check_bool(copied);
+    winrt::com_ptr<IStream> stream;
+    winrt::check_hresult(CreateStreamOnHGlobal(nullptr, TRUE, stream.put()));
+    winrt::check_hresult(bitmap.Save(stream.get(), Gdiplus::ImageFormatPNG));
+    STATSTG info{};
+    winrt::check_hresult(stream->Stat(&info, STATFLAG_NONAME));
+    if (info.cbSize.QuadPart > 64 * 1024 * 1024) winrt::throw_hresult(E_OUTOFMEMORY);
+    std::vector<BYTE> result(static_cast<size_t>(info.cbSize.QuadPart));
+    winrt::check_hresult(stream->Seek({}, STREAM_SEEK_SET, nullptr));
+    ULONG read = 0;
+    winrt::check_hresult(stream->Read(result.data(), static_cast<ULONG>(result.size()), &read));
+    if (read != result.size()) winrt::throw_hresult(E_FAIL);
+    return result;
 }

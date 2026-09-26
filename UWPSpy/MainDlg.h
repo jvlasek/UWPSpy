@@ -14,6 +14,7 @@ class CMainDlg : public CDialogImpl<CMainDlg>, public CDialogResize<CMainDlg> {
         TIMER_ID_SET_SELECTED_ELEMENT_INFORMATION,
         TIMER_ID_REFRESH_SELECTED_ELEMENT_INFORMATION,
         TIMER_ID_COPY_SUBTREE_DELAYED,
+        TIMER_ID_WATCH_SUBTREE,
     };
 
     enum {
@@ -184,6 +185,8 @@ class CMainDlg : public CDialogImpl<CMainDlg>, public CDialogResize<CMainDlg> {
     InstanceHandle ElementFromPoint(CPoint pt);
     InstanceHandle ElementFromPointInSubtree(wux::UIElement subtree, CPoint pt);
     InstanceHandle ElementFromPointInSubtree(mux::UIElement subtree, CPoint pt);
+    std::optional<CRect> GetElementScreenRect(InstanceHandle handle, HWND* outWnd = nullptr);
+    std::vector<BYTE> CaptureElementPng(InstanceHandle handle);
     bool CreateFlashArea(InstanceHandle handle);
     void DestroyFlashArea();
     bool SelectElementFromCursor();
@@ -192,7 +195,21 @@ class CMainDlg : public CDialogImpl<CMainDlg>, public CDialogResize<CMainDlg> {
     void OnVisualStateContextMenu(CTreeViewCtrlEx treeView, CPoint point);
     void DumpElementRecursive(std::wstring& output,
                               InstanceHandle handle,
-                              bool isFirst);
+                              bool isFirst, unsigned depth = 0);
+    void StartSubtreeWatch(InstanceHandle handle);
+    void BeginSubtreeWatch();
+    void PollSubtreeWatch();
+    void StopSubtreeWatch(const wchar_t* status);
+    void CloseSubtreeWatch();
+    static INT_PTR CALLBACK WatchDialogProc(HWND, UINT, WPARAM, LPARAM);
+    HWND m_watchDialog = nullptr;
+    InstanceHandle m_watchHandle = 0;
+    bool m_watchPolling = false;
+    bool m_watchScreenshot = false;
+    std::wstring m_watchFolder;
+    std::wstring m_watchPrevious;
+    unsigned m_watchCount = 0;
+    size_t m_watchBytes = 0;
     void ApplyDarkMode();
     static LRESULT CALLBACK ListViewSubclassProc(HWND hWnd,
                                                  UINT uMsg,

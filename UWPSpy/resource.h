@@ -32,13 +32,19 @@
 #define IDC_ABOUT_BUTTON_HOMEPAGE       1023
 #define IDC_ABOUT_BUTTON_SOURCE_CODE    1024
 
+#define IDD_WATCH_SUBTREE              204
+#define IDC_WATCH_STATUS               1026
+#define IDC_WATCH_FOLDER               1027
+#define IDC_WATCH_START                1028
+#define IDC_WATCH_SCREENSHOT           1029
+
 // Next default values for new objects
 // 
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
-#define _APS_NEXT_RESOURCE_VALUE        204
+#define _APS_NEXT_RESOURCE_VALUE        205
 #define _APS_NEXT_COMMAND_VALUE         32775
-#define _APS_NEXT_CONTROL_VALUE         1026
+#define _APS_NEXT_CONTROL_VALUE         1030
 #define _APS_NEXT_SYMED_VALUE           100
 #endif
 #endif
