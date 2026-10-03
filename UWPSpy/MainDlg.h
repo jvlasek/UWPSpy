@@ -1,6 +1,7 @@
 #pragma once
 
 #include "resource.h"
+#include "ipc.h"
 #include "winrt.hpp"
 
 #include "../common/dark_mode.h"
@@ -68,6 +69,7 @@ class CMainDlg : public CDialogImpl<CMainDlg>, public CDialogResize<CMainDlg> {
         COMMAND_HANDLER_EX(IDC_STICKY, BN_CLICKED, OnSticky)
         COMMAND_ID_HANDLER_EX(ID_APP_ABOUT, OnAppAbout)
         COMMAND_ID_HANDLER_EX(IDCANCEL, OnCancel)
+        MESSAGE_HANDLER_EX(ipc::Server::Message, OnIpcRequest)
         MESSAGE_HANDLER_EX(UWM_ACTIVATE_WINDOW, OnActivateWindow)
         MESSAGE_HANDLER_EX(UWM_DESTROY_WINDOW, OnDestroyWindow)
         // ----------
@@ -210,6 +212,15 @@ class CMainDlg : public CDialogImpl<CMainDlg>, public CDialogResize<CMainDlg> {
     std::wstring m_watchPrevious;
     unsigned m_watchCount = 0;
     size_t m_watchBytes = 0;
+    LRESULT OnIpcRequest(UINT, WPARAM, LPARAM);
+    ipc::json::JsonObject ExecuteIpc(ipc::json::JsonObject const& request);
+    void PublishWatchEvent(const wchar_t* kind, const std::wstring& detail);
+    std::shared_ptr<ipc::Server> m_ipc;
+    std::wstring m_ipcTree;
+    bool m_ipcBusy = false;
+    std::wstring m_stepLabel;
+    std::unordered_map<InstanceHandle, uint64_t> m_elementGeneration;
+    uint64_t m_nextElementGeneration = 0;
     void ApplyDarkMode();
     static LRESULT CALLBACK ListViewSubclassProc(HWND hWnd,
                                                  UINT uMsg,

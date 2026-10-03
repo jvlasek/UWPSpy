@@ -64,6 +64,12 @@ For the notification-badge investigation, begin watching the app's IconPanel
 while its badge looks correct, let a new notification arrive, and compare the
 last good and first bad snapshots. Keep the inspection window open overnight.
 
+## Automated inspection
+
+The inspector exposes a same-user named pipe while its windows are open.
+See [tools/README.md](tools/README.md) for the Python CLI/client, one-shot reads,
+labelled captures, and watch notifications.
+
 ## Demo
 
 [![Demo video](screenshot-video.png)](https://youtu.be/Zxgk_BOVpfk)

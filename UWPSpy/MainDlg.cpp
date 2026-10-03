@@ -1,6 +1,8 @@
 #include "stdafx.h"
 
 #include "MainDlg.h"
+#include <winrt/Windows.UI.Xaml.Automation.h>
+#include <winrt/Microsoft.UI.Xaml.Automation.h>
 
 #include "AboutDlg.h"
 #include "flash_area.h"
@@ -830,10 +832,10 @@ inline DWORD_PTR ListItemDataToDWordPtr(bool valueShownAsIs,
 void CMainDlg::DumpElementRecursive(std::wstring& output,
                                     InstanceHandle handle,
                                     bool isFirst, unsigned depth) {
-    if (m_watchPolling && depth > 256) {
+    if ((m_watchPolling || m_ipcBusy) && depth > 256) {
         throw winrt::hresult_error(E_FAIL, L"Subtree is too deep to watch.");
     }
-    if (m_watchPolling && output.size() > 5 * 1024 * 1024) {
+    if ((m_watchPolling || m_ipcBusy) && output.size() > 5 * 1024 * 1024) {
         throw winrt::hresult_error(E_OUTOFMEMORY, L"Subtree snapshot exceeds 10 MiB.");
     }
     // Skip separator for first element
@@ -1114,6 +1116,8 @@ void CMainDlg::ElementAdded(const ParentChildRelation& parentChildRelation,
         itElementItem = itElementItem2;
     }
 
+    m_elementGeneration[element.Handle] = ++m_nextElementGeneration;
+
     HTREEITEM parentItem = nullptr;
     HTREEITEM insertAfter = TVI_LAST;
 
@@ -1222,6 +1226,7 @@ void CMainDlg::ElementRemoved(InstanceHandle handle) {
                        children.end());
     }
 
+    m_elementGeneration.erase(handle);
     m_elementItems.erase(it);
 }
 
@@ -1299,11 +1304,20 @@ BOOL CMainDlg::OnInitDialog(CWindow wndFocus, LPARAM lInitParam) {
     }
 
     ApplyDarkMode();
-
+    try {
+        m_ipc = ipc::Server::Acquire();
+        m_ipcTree = m_ipc->Register(m_hWnd, GetCurrentThreadId());
+    } catch (...) {
+        OutputDebugString(L"UWPSpy: inspection IPC could not start.\n");
+    }
     return TRUE;
 }
 
-void CMainDlg::OnDestroy() { CloseSubtreeWatch(); }
+void CMainDlg::OnDestroy() {
+    CloseSubtreeWatch();
+    if (m_ipc) m_ipc->Unregister(m_ipcTree);
+    m_ipc.reset();
+}
 
 void CMainDlg::ApplyDarkMode() {
     if (!dark_mode::IsSystemDarkModeSupported()) {
@@ -3070,6 +3084,7 @@ INT_PTR CALLBACK CMainDlg::WatchDialogProc(HWND hwnd, UINT message,
 }
 
 void CMainDlg::StopSubtreeWatch(const wchar_t* status) {
+    if (m_watchHandle) PublishWatchEvent(L"stopped", status);
     KillTimer(TIMER_ID_WATCH_SUBTREE);
     m_watchHandle = 0;
     if (m_watchDialog) {
@@ -3141,6 +3156,7 @@ void CMainDlg::BeginSubtreeWatch() {
         ::SetDlgItemText(m_watchDialog, IDC_WATCH_FOLDER, m_watchFolder.c_str());
         ::SetDlgItemText(m_watchDialog, IDC_WATCH_STATUS,
             L"Starting in 2 seconds. Open the flyout now if needed.");
+        PublishWatchEvent(L"started", m_watchFolder);
         if (!SetTimer(TIMER_ID_WATCH_SUBTREE, 2000)) {
             StopSubtreeWatch(L"Stopped: could not start polling timer.");
         }
@@ -3205,6 +3221,7 @@ void CMainDlg::PollSubtreeWatch() {
                 pngFile.close();
                 winrt::check_bool(MoveFile(partialPng.c_str(), pngName.c_str()));
             }
+            PublishWatchEvent(L"snapshot", filename);
             ++m_watchCount;
             m_watchBytes += utf8.size() + png.size();
             m_watchPrevious = std::move(snapshot);
@@ -3268,5 +3285,188 @@ std::vector<BYTE> CMainDlg::CaptureElementPng(InstanceHandle handle) {
     ULONG read = 0;
     winrt::check_hresult(stream->Read(result.data(), static_cast<ULONG>(result.size()), &read));
     if (read != result.size()) winrt::throw_hresult(E_FAIL);
+    return result;
+}
+
+namespace {
+std::wstring IpcTimestamp() {
+    SYSTEMTIME t; GetSystemTime(&t);
+    return std::format(L"{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+}
+void IpcSaveFile(std::wstring const& path, void const* bytes, size_t size) {
+    auto partial = path + L".partial";
+    winrt::handle file(CreateFile(partial.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+    winrt::check_bool(bool(file));
+    DWORD written = 0;
+    winrt::check_bool(WriteFile(file.get(), bytes, static_cast<DWORD>(size), &written, nullptr));
+    if (written != size) winrt::throw_hresult(E_FAIL);
+    file.close();
+    winrt::check_bool(MoveFile(partial.c_str(), path.c_str()));
+}
+}
+void CMainDlg::PublishWatchEvent(const wchar_t* kind, const std::wstring& detail) {
+    // Best-effort notifications must not break capture or GUI shutdown.
+    try {
+        if (!m_ipc) return;
+        ipc::json::JsonObject event;
+        ipc::String(event, L"kind", kind);
+        ipc::String(event, L"label", m_stepLabel);
+        ipc::String(event, L"utc", IpcTimestamp());
+        ipc::String(event, L"detail", detail);
+        ipc::String(event, L"handle", std::to_wstring(m_watchHandle));
+        if (kind == std::wstring_view(L"snapshot")) {
+            ipc::String(event, L"snapshot", std::to_wstring(m_watchCount + 1));
+            if (m_watchScreenshot) ipc::String(event, L"png", detail.substr(0, detail.size() - 4) + L".png");
+        }
+        m_ipc->Publish(m_ipcTree, event);
+    } catch (...) {}
+}
+LRESULT CMainDlg::OnIpcRequest(UINT, WPARAM, LPARAM) {
+    if (!m_ipc) return 0;
+    auto request = m_ipc->Take(m_ipcTree);
+    if (!request) return 0;
+    try {
+        if (m_ipcBusy || m_watchPolling) {
+            request->output = ipc::Error(L"busy; retry read requests later").Stringify();
+        } else {
+            m_ipcBusy = true;
+            struct Reset { bool& v; ~Reset() { v = false; } } reset{m_ipcBusy};
+            auto command = ipc::json::JsonObject::Parse(request->input);
+            auto started = IpcTimestamp();
+            auto result = ExecuteIpc(command);
+            ipc::String(result, L"started_utc", started);
+            ipc::String(result, L"ended_utc", IpcTimestamp());
+            ipc::String(result, L"label", m_stepLabel);
+            ipc::String(result, L"tree", m_ipcTree);
+            request->output = result.Stringify();
+        }
+    } catch (winrt::hresult_error const& error) {
+        request->output = ipc::Error(error.message()).Stringify();
+    } catch (...) {
+        request->output = ipc::Error(L"invalid request or element no longer available").Stringify();
+    }
+    SetEvent(request->done.get());
+    return 0;
+}
+ipc::json::JsonObject CMainDlg::ExecuteIpc(ipc::json::JsonObject const& request) {
+    namespace json = ipc::json;
+    auto op = request.GetNamedString(L"op");
+    json::JsonObject result;
+    if (request.HasKey(L"label")) {
+        auto label = request.GetNamedString(L"label");
+        if (label.size() > 256) winrt::throw_hresult(E_INVALIDARG);
+        m_stepLabel = label;
+    }
+    if (op == L"label") {
+        PublishWatchEvent(L"step", m_stepLabel);
+        return result;
+    }
+    if (op == L"stop") { CloseSubtreeWatch(); return result; }
+    if (op == L"find") {
+        auto type = request.GetNamedString(L"type", L"Taskbar.TaskListButton");
+        auto contains = request.GetNamedString(L"automation_contains", L"");
+        auto exact = request.GetNamedString(L"automation_name", L"");
+        json::JsonArray matches;
+        std::vector<std::pair<InstanceHandle, uint64_t>> candidates;
+        for (auto const& [handle, item] : m_elementItems) {
+            auto split = item.itemTitle.find(L" - ");
+            if (type.empty() || std::wstring_view(item.itemTitle).substr(0, split) == type) {
+                candidates.emplace_back(handle, m_elementGeneration.at(handle));
+            }
+        }
+        if (candidates.size() > 10000) return ipc::Error(L"find too broad; specify a type");
+        for (auto [handle, generation] : candidates) {
+            wf::IInspectable object;
+            if (FAILED(m_xamlDiagnostics->GetIInspectableFromHandle(handle,
+                reinterpret_cast<::IInspectable**>(winrt::put_abi(object)))) || !object) continue;
+            std::wstring automation;
+            if (auto element = object.try_as<wux::DependencyObject>()) automation = wux::Automation::AutomationProperties::GetName(element);
+            else if (auto element = object.try_as<mux::DependencyObject>()) automation = mux::Automation::AutomationProperties::GetName(element);
+            if ((!exact.empty() && automation != exact) ||
+                (!contains.empty() && automation.find(contains) == std::wstring::npos)) continue;
+            auto current = m_elementGeneration.find(handle);
+            if (current == m_elementGeneration.end() || current->second != generation) continue;
+            json::JsonObject match;
+            ipc::String(match, L"handle", std::to_wstring(handle));
+            ipc::String(match, L"generation", std::to_wstring(generation));
+            ipc::String(match, L"automation_name", automation);
+            ipc::String(match, L"type", winrt::get_class_name(object));
+            ipc::String(match, L"tree", m_ipcTree);
+            matches.Append(match);
+        }
+        result.Insert(L"matches", matches);
+        return result;
+    }
+    if (op != L"get" && op != L"capture" && op != L"watch") return ipc::Error(L"unknown operation");
+    auto handle = static_cast<InstanceHandle>(std::stoull(std::wstring(request.GetNamedString(L"handle"))));
+    auto generation = std::stoull(std::wstring(request.GetNamedString(L"generation")));
+    auto it = m_elementGeneration.find(handle);
+    if (it == m_elementGeneration.end() || it->second != generation) return ipc::Error(L"stale element identity; find again");
+    if (op == L"watch") {
+        if (m_watchDialog) return ipc::Error(L"a watcher already exists in this tree; stop it first");
+        StartSubtreeWatch(handle);
+        if (!m_watchDialog) return ipc::Error(L"could not open watch dialog");
+        auto folder = request.GetNamedString(L"output");
+        ::SetDlgItemText(m_watchDialog, IDC_WATCH_FOLDER, folder.c_str());
+        ::CheckDlgButton(m_watchDialog, IDC_WATCH_SCREENSHOT,
+            request.GetNamedBoolean(L"screenshots", false) ? BST_CHECKED : BST_UNCHECKED);
+        BeginSubtreeWatch();
+        // Successful start makes the edit read-only; invalid directories leave setup active.
+        if (!m_watchHandle || ::IsWindowEnabled(::GetDlgItem(m_watchDialog, IDC_WATCH_START))) {
+            CloseSubtreeWatch(); return ipc::Error(L"watch failed to start; check output directory");
+        }
+        ipc::String(result, L"folder", m_watchFolder);
+        return result;
+    }
+    std::wstring dump;
+    DumpElementRecursive(dump, handle, true);
+    auto current = m_elementGeneration.find(handle);
+    if (current == m_elementGeneration.end() || current->second != generation) return ipc::Error(L"element removed during capture");
+    if (dump.size() > 5 * 1024 * 1024) return ipc::Error(L"snapshot too large");
+    ipc::String(result, L"handle", std::to_wstring(handle));
+    ipc::String(result, L"generation", std::to_wstring(generation));
+    ipc::String(result, L"dump", dump);
+    // Use the same physical screen geometry as screenshot export. Consumers
+    // must not guess desktop coordinates from the root-relative text dump.
+    try {
+        if (auto bounds = GetElementScreenRect(handle)) {
+            if (!bounds->IsRectEmpty()) {
+                json::JsonArray rect;
+                for (LONG value : {bounds->left, bounds->top, bounds->right, bounds->bottom}) {
+                    rect.Append(json::JsonValue::CreateNumberValue(value));
+                }
+                result.Insert(L"screen_rect", rect);
+            }
+        }
+    } catch (...) {
+        // Geometry is optional; a text export remains useful without it.
+    }
+    if (op == L"capture") {
+        std::wstring folder(request.GetNamedString(L"output"));
+        DWORD attrs = GetFileAttributes(folder.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return ipc::Error(L"output directory does not exist");
+        std::vector<BYTE> png;
+        if (request.GetNamedBoolean(L"screenshots", false)) png = CaptureElementPng(handle);
+        GUID guid; winrt::check_hresult(CoCreateGuid(&guid));
+        wchar_t id[40]; StringFromGUID2(guid, id, ARRAYSIZE(id));
+        auto stem = folder + L"\\capture-" + id;
+        auto text = winrt::to_string(dump);
+        IpcSaveFile(stem + L".txt", text.data(), text.size());
+        ipc::String(result, L"text", stem + L".txt");
+        if (!png.empty()) {
+            IpcSaveFile(stem + L".png", png.data(), png.size());
+            ipc::String(result, L"png", stem + L".png");
+        }
+        json::JsonObject metadata;
+        ipc::String(metadata, L"label", m_stepLabel);
+        ipc::String(metadata, L"utc", IpcTimestamp());
+        ipc::String(metadata, L"tree", m_ipcTree);
+        ipc::String(metadata, L"handle", std::to_wstring(handle));
+        auto bytes = winrt::to_string(metadata.Stringify());
+        IpcSaveFile(stem + L".json", bytes.data(), bytes.size());
+        result.Remove(L"dump");
+    }
     return result;
 }
