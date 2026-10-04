@@ -35,7 +35,7 @@ python .\tools\uwspy_cli.py stop --endpoint $endpoint --tree 1
 ```
 
 Output folders must already exist. `get` writes no files and returns the dump
-plus parsed nodes. Local and other property-source values remain separate;
+plus parsed nodes. The IPC response also includes optional `screen_rect` as [left, top, right, bottom] physical desktop pixels, using the same bounds calculation as screenshot export. The field is absent when bounds cannot be obtained; consumers must not substitute the root-relative dump rectangle. Local and other property-source values remain separate;
 `other` values must not be mistaken for effective values when a local override
 exists. Version 1 selectors are `--type`, exact `--name` (AutomationProperties.Name),
 and `--contains`, optionally scoped to a tree. A general path/query grammar is
